@@ -7,6 +7,71 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_LIMIT: i64 = 50;
+const MAX_LIMIT: i64 = 200;
+const DEFAULT_OFFSET: i64 = 0;
+
+const VALID_CANDIDATE_STATUSES: &[&str] = &["sourced", "screening", "interview", "offer", "placed", "rejected"];
+const VALID_JOB_STATUSES: &[&str] = &["open", "closed", "filled", "on_hold"];
+
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
+/// Trim a string, returning None if empty after trimming
+fn trim_non_empty(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Get a required trimmed string param, or return an error message
+fn require_trimmed_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
+    match get_str(args, key) {
+        Some(s) => trim_non_empty(&s)
+            .ok_or_else(|| format!("Parameter '{}' cannot be empty or whitespace-only", key)),
+        None => Err(format!("Missing required parameter: {}", key)),
+    }
+}
+
+/// Get an optional trimmed string param
+fn optional_trimmed_str(args: &serde_json::Value, key: &str) -> Option<String> {
+    get_str(args, key).and_then(|s| trim_non_empty(&s))
+}
+
+/// Basic email validation (must contain @ with text on both sides)
+fn is_valid_email(email: &str) -> bool {
+    let parts: Vec<&str> = email.split('@').collect();
+    parts.len() == 2 && !parts[0].is_empty() && parts[1].contains('.')
+}
+
+/// Validate limit/offset pagination params and clamp to sane defaults
+fn pagination(args: &serde_json::Value) -> (i64, i64) {
+    let limit = get_i64(args, "limit")
+        .unwrap_or(DEFAULT_LIMIT)
+        .max(1)
+        .min(MAX_LIMIT);
+    let offset = get_i64(args, "offset")
+        .unwrap_or(DEFAULT_OFFSET)
+        .max(0);
+    (limit, offset)
+}
+
+/// Trim all strings in an array and filter out empty entries
+fn trimmed_str_array(args: &serde_json::Value, key: &str) -> Vec<String> {
+    get_str_array(args, key)
+        .into_iter()
+        .filter_map(|s| trim_non_empty(&s))
+        .collect()
+}
+
+// ============================================================================
 // Data types
 // ============================================================================
 
@@ -97,6 +162,28 @@ pub struct PlacementRow {
 // Tool definitions
 // ============================================================================
 
+/// Pagination properties shared across list/search tools
+fn pagination_props() -> serde_json::Value {
+    serde_json::json!({
+        "limit": { "type": "integer", "description": "Max results to return (default: 50, max: 200)" },
+        "offset": { "type": "integer", "description": "Number of results to skip for pagination (default: 0)" }
+    })
+}
+
+/// Merge two JSON objects
+fn merge_props(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
+    let mut map = match a {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    if let serde_json::Value::Object(m2) = b {
+        for (k, v) in m2 {
+            map.insert(k, v);
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
 fn build_tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -109,9 +196,9 @@ fn build_tools() -> Vec<Tool> {
                     "email": { "type": "string", "description": "Email address" },
                     "phone": { "type": "string", "description": "Phone number" },
                     "skills": { "type": "array", "items": { "type": "string" }, "description": "List of skills" },
-                    "experience_years": { "type": "integer", "description": "Years of experience" },
+                    "experience_years": { "type": "integer", "description": "Years of experience (must be >= 0)" },
                     "current_company": { "type": "string", "description": "Current employer" },
-                    "desired_salary": { "type": "number", "description": "Desired annual salary" },
+                    "desired_salary": { "type": "number", "description": "Desired annual salary (must be > 0)" },
                     "resume_url": { "type": "string", "description": "URL to resume/CV" },
                     "source": { "type": "string", "description": "Where the candidate was sourced from (e.g. LinkedIn, referral)" }
                 }),
@@ -126,16 +213,19 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "search_candidates".into(),
             title: None,
-            description: Some("Search candidates with full-text search on name, skills, company. Filter by min experience, skills match, salary range.".into()),
+            description: Some("Search candidates with full-text search on name, skills, company. Filter by min experience, skills match, salary range. Supports pagination with limit/offset.".into()),
             input_schema: make_schema(
-                serde_json::json!({
-                    "query": { "type": "string", "description": "Free-text search across name, skills, company" },
-                    "min_experience": { "type": "integer", "description": "Minimum years of experience" },
-                    "skills": { "type": "array", "items": { "type": "string" }, "description": "Required skills (candidates must have ALL)" },
-                    "salary_min": { "type": "number", "description": "Minimum desired salary" },
-                    "salary_max": { "type": "number", "description": "Maximum desired salary" },
-                    "status": { "type": "string", "description": "Filter by candidate status" }
-                }),
+                merge_props(
+                    serde_json::json!({
+                        "query": { "type": "string", "description": "Free-text search across name, skills, company" },
+                        "min_experience": { "type": "integer", "description": "Minimum years of experience (must be >= 0)" },
+                        "skills": { "type": "array", "items": { "type": "string" }, "description": "Required skills (candidates must have ALL)" },
+                        "salary_min": { "type": "number", "description": "Minimum desired salary (must be > 0)" },
+                        "salary_max": { "type": "number", "description": "Maximum desired salary (must be > 0)" },
+                        "status": { "type": "string", "description": "Filter by candidate status" }
+                    }),
+                    pagination_props(),
+                ),
                 vec![],
             ),
             output_schema: None,
@@ -154,8 +244,8 @@ fn build_tools() -> Vec<Tool> {
                     "company": { "type": "string", "description": "Hiring company" },
                     "description": { "type": "string", "description": "Job description" },
                     "requirements": { "type": "array", "items": { "type": "string" }, "description": "Required skills/qualifications" },
-                    "salary_min": { "type": "number", "description": "Minimum salary" },
-                    "salary_max": { "type": "number", "description": "Maximum salary" },
+                    "salary_min": { "type": "number", "description": "Minimum salary (must be > 0)" },
+                    "salary_max": { "type": "number", "description": "Maximum salary (must be > 0)" },
                     "location": { "type": "string", "description": "Job location" },
                     "status": { "type": "string", "enum": ["open", "closed", "filled", "on_hold"], "description": "Job status (default: open)" }
                 }),
@@ -170,12 +260,14 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "match_candidates".into(),
             title: None,
-            description: Some("Find candidates matching a job's requirements, ranked by fit score based on skill overlap and experience".into()),
+            description: Some("Find candidates matching a job's requirements, ranked by fit score based on skill overlap and experience. Supports pagination with limit/offset.".into()),
             input_schema: make_schema(
-                serde_json::json!({
-                    "job_id": { "type": "string", "description": "Job ID to match against" },
-                    "limit": { "type": "integer", "description": "Max results (default: 20)" }
-                }),
+                merge_props(
+                    serde_json::json!({
+                        "job_id": { "type": "string", "description": "Job ID to match against" }
+                    }),
+                    pagination_props(),
+                ),
                 vec!["job_id"],
             ),
             output_schema: None,
@@ -223,11 +315,14 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "candidate_pipeline".into(),
             title: None,
-            description: Some("Show all candidates by stage for a specific job".into()),
+            description: Some("Show all candidates by stage for a specific job. Supports pagination with limit/offset.".into()),
             input_schema: make_schema(
-                serde_json::json!({
-                    "job_id": { "type": "string", "description": "Job ID to view pipeline for" }
-                }),
+                merge_props(
+                    serde_json::json!({
+                        "job_id": { "type": "string", "description": "Job ID to view pipeline for" }
+                    }),
+                    pagination_props(),
+                ),
                 vec!["job_id"],
             ),
             output_schema: None,
@@ -268,13 +363,16 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "talent_search_saved".into(),
             title: None,
-            description: Some("Save or list saved search criteria for reuse. If 'name' and 'criteria' provided, saves a new search. Otherwise lists all saved searches.".into()),
+            description: Some("Save or list saved search criteria for reuse. If 'name' and 'criteria' provided, saves a new search. Otherwise lists all saved searches with pagination.".into()),
             input_schema: make_schema(
-                serde_json::json!({
-                    "name": { "type": "string", "description": "Name for the saved search" },
-                    "criteria": { "type": "object", "description": "Search criteria to save (query, skills, min_experience, salary_min, salary_max, status)" },
-                    "created_by": { "type": "string", "description": "Who created this saved search" }
-                }),
+                merge_props(
+                    serde_json::json!({
+                        "name": { "type": "string", "description": "Name for the saved search" },
+                        "criteria": { "type": "object", "description": "Search criteria to save (query, skills, min_experience, salary_min, salary_max, status)" },
+                        "created_by": { "type": "string", "description": "Who created this saved search" }
+                    }),
+                    pagination_props(),
+                ),
                 vec![],
             ),
             output_schema: None,
@@ -303,21 +401,33 @@ impl TalentMcpServer {
     // ---- Tool handlers ----
 
     async fn handle_add_candidate(&self, args: &serde_json::Value) -> CallToolResult {
-        let name = match get_str(args, "name") {
-            Some(n) => n,
-            None => return error_result("Missing required parameter: name"),
+        let name = match require_trimmed_str(args, "name") {
+            Ok(n) => n,
+            Err(e) => return error_result(&e),
         };
-        let email = match get_str(args, "email") {
-            Some(e) => e,
-            None => return error_result("Missing required parameter: email"),
+        let email = match require_trimmed_str(args, "email") {
+            Ok(e) => e,
+            Err(e) => return error_result(&e),
         };
-        let phone = get_str(args, "phone").unwrap_or_default();
-        let skills = get_str_array(args, "skills");
+        if !is_valid_email(&email) {
+            return error_result("Invalid email format: must contain '@' with a valid domain (e.g. user@example.com)");
+        }
+
+        let phone = optional_trimmed_str(args, "phone").unwrap_or_default();
+        let skills = trimmed_str_array(args, "skills");
         let experience_years = get_i64(args, "experience_years").unwrap_or(0) as i32;
-        let current_company = get_str(args, "current_company").unwrap_or_default();
+        if experience_years < 0 {
+            return error_result("experience_years must be >= 0");
+        }
+        let current_company = optional_trimmed_str(args, "current_company").unwrap_or_default();
         let desired_salary = get_f64(args, "desired_salary");
-        let resume_url = get_str(args, "resume_url").unwrap_or_default();
-        let source = get_str(args, "source").unwrap_or_default();
+        if let Some(salary) = desired_salary {
+            if salary <= 0.0 {
+                return error_result("desired_salary must be greater than 0");
+            }
+        }
+        let resume_url = optional_trimmed_str(args, "resume_url").unwrap_or_default();
+        let source = optional_trimmed_str(args, "source").unwrap_or_default();
 
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -340,33 +450,63 @@ impl TalentMcpServer {
         .await
         {
             Ok(c) => {
-                info!(name = name, email = email, "Added candidate");
+                info!(name = %name, email = %email, id = %id, "Added candidate");
                 json_result(&c)
             }
-            Err(e) => error_result(&format!("Failed to add candidate: {e}")),
+            Err(e) => {
+                error!(error = %e, name = %name, email = %email, "Failed to add candidate");
+                error_result(&format!("Failed to add candidate: {e}"))
+            }
         }
     }
 
     async fn handle_search_candidates(&self, args: &serde_json::Value) -> CallToolResult {
-        let query = get_str(args, "query");
+        let query = optional_trimmed_str(args, "query");
         let min_experience = get_i64(args, "min_experience").map(|v| v as i32);
-        let skills = get_str_array(args, "skills");
+        if let Some(min_exp) = min_experience {
+            if min_exp < 0 {
+                return error_result("min_experience must be >= 0");
+            }
+        }
+        let skills = trimmed_str_array(args, "skills");
         let salary_min = get_f64(args, "salary_min");
         let salary_max = get_f64(args, "salary_max");
-        let status = get_str(args, "status");
+        if let Some(smin) = salary_min {
+            if smin <= 0.0 {
+                return error_result("salary_min must be greater than 0");
+            }
+        }
+        if let Some(smax) = salary_max {
+            if smax <= 0.0 {
+                return error_result("salary_max must be greater than 0");
+            }
+        }
+        if let (Some(smin), Some(smax)) = (salary_min, salary_max) {
+            if smin > smax {
+                return error_result("salary_min cannot be greater than salary_max");
+            }
+        }
+        let status = optional_trimmed_str(args, "status");
+        if let Some(ref st) = status {
+            if !VALID_CANDIDATE_STATUSES.contains(&st.as_str()) {
+                return error_result(&format!(
+                    "Invalid status '{}'. Must be one of: {}",
+                    st,
+                    VALID_CANDIDATE_STATUSES.join(", ")
+                ));
+            }
+        }
+        let (limit, offset) = pagination(args);
 
         // Build dynamic query
         let mut sql = String::from("SELECT * FROM talent.candidates WHERE 1=1");
         let mut param_idx = 1u32;
 
-        // We'll collect bind values and apply them dynamically
-        // For simplicity, build the full query with positional params
         struct Params {
             strings: Vec<String>,
             ints: Vec<i32>,
             floats: Vec<f64>,
             arrays: Vec<Vec<String>>,
-            // Track which param index maps to which type
             binds: Vec<BindType>,
         }
         enum BindType {
@@ -384,7 +524,6 @@ impl TalentMcpServer {
         };
 
         if let Some(ref q) = query {
-            // FTS: search name, skills array (cast to text), current_company
             sql.push_str(&format!(
                 " AND (name ILIKE ${p} OR current_company ILIKE ${p} OR array_to_string(skills, ' ') ILIKE ${p})",
                 p = param_idx
@@ -402,7 +541,6 @@ impl TalentMcpServer {
         }
 
         if !skills.is_empty() {
-            // candidates must have ALL required skills
             sql.push_str(&format!(" AND skills @> ${}", param_idx));
             params.arrays.push(skills);
             params.binds.push(BindType::StrArray(params.arrays.len() - 1));
@@ -427,10 +565,18 @@ impl TalentMcpServer {
             sql.push_str(&format!(" AND status = ${}", param_idx));
             params.strings.push(st.clone());
             params.binds.push(BindType::Str(params.strings.len() - 1));
-            let _ = param_idx; // suppress unused warning
+            param_idx += 1;
         }
 
-        sql.push_str(" ORDER BY created_at DESC LIMIT 50");
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${} OFFSET ${}", param_idx, param_idx + 1));
+        // Bind limit and offset as i64
+        params.floats.push(limit as f64); // placeholder — we'll bind as i64 below
+        params.floats.push(offset as f64);
+
+        // Actually we need to bind limit/offset differently. Let's use ints.
+        // Remove the float placeholders we just pushed.
+        params.floats.pop();
+        params.floats.pop();
 
         // Build the query with dynamic bindings
         let mut q = sqlx::query_as::<_, Candidate>(&sql);
@@ -442,31 +588,56 @@ impl TalentMcpServer {
                 BindType::StrArray(i) => q = q.bind(&params.arrays[*i]),
             }
         }
+        // Bind limit and offset
+        q = q.bind(limit);
+        q = q.bind(offset);
 
         match q.fetch_all(self.db.pool()).await {
             Ok(candidates) => json_result(&candidates),
-            Err(e) => error_result(&format!("Search failed: {e}")),
+            Err(e) => {
+                error!(error = %e, "Search candidates failed");
+                error_result(&format!("Search failed: {e}"))
+            }
         }
     }
 
     async fn handle_create_job(&self, args: &serde_json::Value) -> CallToolResult {
-        let title = match get_str(args, "title") {
-            Some(t) => t,
-            None => return error_result("Missing required parameter: title"),
+        let title = match require_trimmed_str(args, "title") {
+            Ok(t) => t,
+            Err(e) => return error_result(&e),
         };
-        let company = match get_str(args, "company") {
-            Some(c) => c,
-            None => return error_result("Missing required parameter: company"),
+        let company = match require_trimmed_str(args, "company") {
+            Ok(c) => c,
+            Err(e) => return error_result(&e),
         };
-        let description = get_str(args, "description").unwrap_or_default();
-        let requirements = get_str_array(args, "requirements");
+        let description = optional_trimmed_str(args, "description").unwrap_or_default();
+        let requirements = trimmed_str_array(args, "requirements");
         let salary_min = get_f64(args, "salary_min");
         let salary_max = get_f64(args, "salary_max");
-        let location = get_str(args, "location").unwrap_or_default();
-        let status = get_str(args, "status").unwrap_or_else(|| "open".into());
+        if let Some(smin) = salary_min {
+            if smin <= 0.0 {
+                return error_result("salary_min must be greater than 0");
+            }
+        }
+        if let Some(smax) = salary_max {
+            if smax <= 0.0 {
+                return error_result("salary_max must be greater than 0");
+            }
+        }
+        if let (Some(smin), Some(smax)) = (salary_min, salary_max) {
+            if smin > smax {
+                return error_result("salary_min cannot be greater than salary_max");
+            }
+        }
+        let location = optional_trimmed_str(args, "location").unwrap_or_default();
+        let status = optional_trimmed_str(args, "status").unwrap_or_else(|| "open".into());
 
-        if !["open", "closed", "filled", "on_hold"].contains(&status.as_str()) {
-            return error_result("status must be one of: open, closed, filled, on_hold");
+        if !VALID_JOB_STATUSES.contains(&status.as_str()) {
+            return error_result(&format!(
+                "Invalid status '{}'. Must be one of: {}",
+                status,
+                VALID_JOB_STATUSES.join(", ")
+            ));
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -489,19 +660,22 @@ impl TalentMcpServer {
         .await
         {
             Ok(job) => {
-                info!(title = title, company = company, "Created job");
+                info!(title = %title, company = %company, id = %id, "Created job");
                 json_result(&job)
             }
-            Err(e) => error_result(&format!("Failed to create job: {e}")),
+            Err(e) => {
+                error!(error = %e, title = %title, company = %company, "Failed to create job");
+                error_result(&format!("Failed to create job: {e}"))
+            }
         }
     }
 
     async fn handle_match_candidates(&self, args: &serde_json::Value) -> CallToolResult {
-        let job_id = match get_str(args, "job_id") {
-            Some(j) => j,
-            None => return error_result("Missing required parameter: job_id"),
+        let job_id = match require_trimmed_str(args, "job_id") {
+            Ok(j) => j,
+            Err(e) => return error_result(&e),
         };
-        let limit = get_i64(args, "limit").unwrap_or(20);
+        let (limit, offset) = pagination(args);
 
         // Fetch the job to get requirements
         let job: Job = match sqlx::query_as("SELECT * FROM talent.jobs WHERE id = $1")
@@ -510,8 +684,11 @@ impl TalentMcpServer {
             .await
         {
             Ok(Some(j)) => j,
-            Ok(None) => return error_result(&format!("Job '{job_id}' not found")),
-            Err(e) => return error_result(&format!("Database error: {e}")),
+            Ok(None) => return error_result(&format!("Job '{}' not found", job_id)),
+            Err(e) => {
+                error!(error = %e, job_id = %job_id, "Failed to fetch job for matching");
+                return error_result(&format!("Database error: {e}"));
+            }
         };
 
         if job.requirements.is_empty() {
@@ -519,7 +696,6 @@ impl TalentMcpServer {
         }
 
         // Fetch candidates who have at least one overlapping skill
-        // Use && (overlap) operator for initial filter, then rank in Rust
         let candidates: Vec<Candidate> = match sqlx::query_as::<_, Candidate>(
             "SELECT * FROM talent.candidates WHERE skills && $1 AND status NOT IN ('placed', 'rejected') ORDER BY experience_years DESC",
         )
@@ -528,7 +704,10 @@ impl TalentMcpServer {
         .await
         {
             Ok(c) => c,
-            Err(e) => return error_result(&format!("Match query failed: {e}")),
+            Err(e) => {
+                error!(error = %e, job_id = %job_id, "Match query failed");
+                return error_result(&format!("Match query failed: {e}"));
+            }
         };
 
         let req_set: std::collections::HashSet<String> =
@@ -543,7 +722,6 @@ impl TalentMcpServer {
                 let matching: Vec<String> = req_set.intersection(&cand_skills).cloned().collect();
                 let missing: Vec<String> = req_set.difference(&cand_skills).cloned().collect();
                 let skill_score = matching.len() as f64 / req_count;
-                // Bonus for experience (up to 0.2 extra)
                 let exp_bonus = (c.experience_years as f64 / 20.0).min(0.2);
                 let fit_score = ((skill_score * 0.8 + exp_bonus) * 100.0).round() / 100.0;
                 MatchResult {
@@ -556,21 +734,55 @@ impl TalentMcpServer {
             .collect();
 
         results.sort_by(|a, b| b.fit_score.partial_cmp(&a.fit_score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(limit as usize);
 
-        json_result(&results)
+        // Apply pagination: skip `offset` results, take `limit`
+        let paginated: Vec<MatchResult> = results
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+
+        json_result(&paginated)
     }
 
     async fn handle_submit_candidate(&self, args: &serde_json::Value) -> CallToolResult {
-        let candidate_id = match get_str(args, "candidate_id") {
-            Some(c) => c,
-            None => return error_result("Missing required parameter: candidate_id"),
+        let candidate_id = match require_trimmed_str(args, "candidate_id") {
+            Ok(c) => c,
+            Err(e) => return error_result(&e),
         };
-        let job_id = match get_str(args, "job_id") {
-            Some(j) => j,
-            None => return error_result("Missing required parameter: job_id"),
+        let job_id = match require_trimmed_str(args, "job_id") {
+            Ok(j) => j,
+            Err(e) => return error_result(&e),
         };
-        let submitted_by = get_str(args, "submitted_by").unwrap_or_default();
+        let submitted_by = optional_trimmed_str(args, "submitted_by").unwrap_or_default();
+
+        // Verify candidate exists
+        match sqlx::query_as::<_, Candidate>("SELECT * FROM talent.candidates WHERE id = $1")
+            .bind(&candidate_id)
+            .fetch_optional(self.db.pool())
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return error_result(&format!("Candidate '{}' not found", candidate_id)),
+            Err(e) => {
+                error!(error = %e, candidate_id = %candidate_id, "Failed to verify candidate");
+                return error_result(&format!("Database error: {e}"));
+            }
+        }
+
+        // Verify job exists
+        match sqlx::query_as::<_, Job>("SELECT * FROM talent.jobs WHERE id = $1")
+            .bind(&job_id)
+            .fetch_optional(self.db.pool())
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return error_result(&format!("Job '{}' not found", job_id)),
+            Err(e) => {
+                error!(error = %e, job_id = %job_id, "Failed to verify job");
+                return error_result(&format!("Database error: {e}"));
+            }
+        }
 
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -587,27 +799,33 @@ impl TalentMcpServer {
         .await
         {
             Ok(sub) => {
-                info!(candidate_id = candidate_id, job_id = job_id, "Submitted candidate to job");
+                info!(candidate_id = %candidate_id, job_id = %job_id, id = %id, "Submitted candidate to job");
                 json_result(&sub)
             }
-            Err(e) => error_result(&format!("Failed to submit candidate: {e}")),
+            Err(e) => {
+                error!(error = %e, candidate_id = %candidate_id, job_id = %job_id, "Failed to submit candidate");
+                error_result(&format!("Failed to submit candidate: {e}"))
+            }
         }
     }
 
     async fn handle_update_status(&self, args: &serde_json::Value) -> CallToolResult {
-        let candidate_id = match get_str(args, "candidate_id") {
-            Some(c) => c,
-            None => return error_result("Missing required parameter: candidate_id"),
+        let candidate_id = match require_trimmed_str(args, "candidate_id") {
+            Ok(c) => c,
+            Err(e) => return error_result(&e),
         };
-        let status = match get_str(args, "status") {
-            Some(s) => s,
-            None => return error_result("Missing required parameter: status"),
+        let status = match require_trimmed_str(args, "status") {
+            Ok(s) => s,
+            Err(e) => return error_result(&e),
         };
-        let job_id = get_str(args, "job_id");
+        let job_id = optional_trimmed_str(args, "job_id");
 
-        let valid = ["sourced", "screening", "interview", "offer", "placed", "rejected"];
-        if !valid.contains(&status.as_str()) {
-            return error_result(&format!("status must be one of: {}", valid.join(", ")));
+        if !VALID_CANDIDATE_STATUSES.contains(&status.as_str()) {
+            return error_result(&format!(
+                "Invalid status '{}'. Must be one of: {}",
+                status,
+                VALID_CANDIDATE_STATUSES.join(", ")
+            ));
         }
 
         // Update candidate status
@@ -620,11 +838,10 @@ impl TalentMcpServer {
         .await
         {
             Ok(Some(c)) => {
-                info!(candidate_id = candidate_id, status = status, "Updated candidate status");
+                info!(candidate_id = %candidate_id, status = %status, "Updated candidate status");
 
                 // Also update submission status if job_id provided
                 if let Some(ref jid) = job_id {
-                    // Map candidate status to submission status
                     let sub_status = match status.as_str() {
                         "screening" => "reviewing",
                         "interview" => "interview",
@@ -633,28 +850,36 @@ impl TalentMcpServer {
                         "rejected" => "rejected",
                         _ => "submitted",
                     };
-                    let _ = sqlx::query(
+                    if let Err(e) = sqlx::query(
                         "UPDATE talent.submissions SET status = $1, updated_at = now() WHERE candidate_id = $2 AND job_id = $3",
                     )
                     .bind(sub_status)
                     .bind(&candidate_id)
                     .bind(jid)
                     .execute(self.db.pool())
-                    .await;
+                    .await
+                    {
+                        error!(error = %e, candidate_id = %candidate_id, job_id = %jid, "Failed to update submission status");
+                        // Don't fail the whole operation — candidate status was updated
+                    }
                 }
 
                 json_result(&c)
             }
-            Ok(None) => error_result(&format!("Candidate '{candidate_id}' not found")),
-            Err(e) => error_result(&format!("Failed to update status: {e}")),
+            Ok(None) => error_result(&format!("Candidate '{}' not found", candidate_id)),
+            Err(e) => {
+                error!(error = %e, candidate_id = %candidate_id, "Failed to update candidate status");
+                error_result(&format!("Failed to update status: {e}"))
+            }
         }
     }
 
     async fn handle_candidate_pipeline(&self, args: &serde_json::Value) -> CallToolResult {
-        let job_id = match get_str(args, "job_id") {
-            Some(j) => j,
-            None => return error_result("Missing required parameter: job_id"),
+        let job_id = match require_trimmed_str(args, "job_id") {
+            Ok(j) => j,
+            Err(e) => return error_result(&e),
         };
+        let (limit, offset) = pagination(args);
 
         let entries: Vec<PipelineEntry> = match sqlx::query_as(
             r#"SELECT s.candidate_id, c.name AS candidate_name, c.email AS candidate_email,
@@ -662,14 +887,20 @@ impl TalentMcpServer {
                FROM talent.submissions s
                JOIN talent.candidates c ON c.id = s.candidate_id
                WHERE s.job_id = $1
-               ORDER BY s.status, s.submitted_at"#,
+               ORDER BY s.status, s.submitted_at
+               LIMIT $2 OFFSET $3"#,
         )
         .bind(&job_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
             Ok(e) => e,
-            Err(e) => return error_result(&format!("Pipeline query failed: {e}")),
+            Err(e) => {
+                error!(error = %e, job_id = %job_id, "Pipeline query failed");
+                return error_result(&format!("Pipeline query failed: {e}"));
+            }
         };
 
         // Group by stage
@@ -685,6 +916,8 @@ impl TalentMcpServer {
         let summary = serde_json::json!({
             "job_id": job_id,
             "total_candidates": entries.len(),
+            "limit": limit,
+            "offset": offset,
             "by_stage": stages.iter().map(|(k, v)| {
                 (k.clone(), serde_json::json!({
                     "count": v.len(),
@@ -716,7 +949,10 @@ impl TalentMcpServer {
         .await
         {
             Ok(s) => s,
-            Err(e) => return error_result(&format!("Stats query failed: {e}")),
+            Err(e) => {
+                error!(error = %e, "Recruiter stats query failed");
+                return error_result(&format!("Stats query failed: {e}"));
+            }
         };
 
         // Overall conversion rates
@@ -757,15 +993,29 @@ impl TalentMcpServer {
     }
 
     async fn handle_add_note(&self, args: &serde_json::Value) -> CallToolResult {
-        let candidate_id = match get_str(args, "candidate_id") {
-            Some(c) => c,
-            None => return error_result("Missing required parameter: candidate_id"),
+        let candidate_id = match require_trimmed_str(args, "candidate_id") {
+            Ok(c) => c,
+            Err(e) => return error_result(&e),
         };
-        let note = match get_str(args, "note") {
-            Some(n) => n,
-            None => return error_result("Missing required parameter: note"),
+        let note = match require_trimmed_str(args, "note") {
+            Ok(n) => n,
+            Err(e) => return error_result(&e),
         };
-        let author = get_str(args, "author").unwrap_or_default();
+        let author = optional_trimmed_str(args, "author").unwrap_or_default();
+
+        // Verify candidate exists
+        match sqlx::query_as::<_, Candidate>("SELECT * FROM talent.candidates WHERE id = $1")
+            .bind(&candidate_id)
+            .fetch_optional(self.db.pool())
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return error_result(&format!("Candidate '{}' not found", candidate_id)),
+            Err(e) => {
+                error!(error = %e, candidate_id = %candidate_id, "Failed to verify candidate for note");
+                return error_result(&format!("Database error: {e}"));
+            }
+        }
 
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -782,20 +1032,23 @@ impl TalentMcpServer {
         .await
         {
             Ok(n) => {
-                info!(candidate_id = candidate_id, "Added note");
+                info!(candidate_id = %candidate_id, id = %id, "Added note");
                 json_result(&n)
             }
-            Err(e) => error_result(&format!("Failed to add note: {e}")),
+            Err(e) => {
+                error!(error = %e, candidate_id = %candidate_id, "Failed to add note");
+                error_result(&format!("Failed to add note: {e}"))
+            }
         }
     }
 
     async fn handle_talent_search_saved(&self, args: &serde_json::Value) -> CallToolResult {
-        let name = get_str(args, "name");
+        let name = optional_trimmed_str(args, "name");
         let criteria = args.get("criteria");
 
         // If name + criteria provided, save. Otherwise list.
         if let (Some(name), Some(criteria)) = (name, criteria) {
-            let created_by = get_str(args, "created_by").unwrap_or_default();
+            let created_by = optional_trimmed_str(args, "created_by").unwrap_or_default();
             let id = uuid::Uuid::new_v4().to_string();
 
             match sqlx::query_as::<_, SavedSearch>(
@@ -811,21 +1064,30 @@ impl TalentMcpServer {
             .await
             {
                 Ok(s) => {
-                    info!(name = name, "Saved search");
+                    info!(name = %name, id = %id, "Saved search");
                     json_result(&s)
                 }
-                Err(e) => error_result(&format!("Failed to save search: {e}")),
+                Err(e) => {
+                    error!(error = %e, name = %name, "Failed to save search");
+                    error_result(&format!("Failed to save search: {e}"))
+                }
             }
         } else {
-            // List all saved searches
+            let (limit, offset) = pagination(args);
+            // List all saved searches with pagination
             match sqlx::query_as::<_, SavedSearch>(
-                "SELECT * FROM talent.saved_searches ORDER BY created_at DESC",
+                "SELECT * FROM talent.saved_searches ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             )
+            .bind(limit)
+            .bind(offset)
             .fetch_all(self.db.pool())
             .await
             {
                 Ok(searches) => json_result(&searches),
-                Err(e) => error_result(&format!("Failed to list saved searches: {e}")),
+                Err(e) => {
+                    error!(error = %e, "Failed to list saved searches");
+                    error_result(&format!("Failed to list saved searches: {e}"))
+                }
             }
         }
     }
