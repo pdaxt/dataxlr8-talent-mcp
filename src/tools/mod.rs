@@ -13,6 +13,8 @@ use tracing::{error, info};
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
 const DEFAULT_OFFSET: i64 = 0;
+const MAX_STRING_LEN: usize = 1000;
+const MAX_NOTE_LEN: usize = 5000;
 
 const VALID_CANDIDATE_STATUSES: &[&str] = &["sourced", "screening", "interview", "offer", "placed", "rejected"];
 const VALID_JOB_STATUSES: &[&str] = &["open", "closed", "filled", "on_hold"];
@@ -33,16 +35,30 @@ fn trim_non_empty(s: &str) -> Option<String> {
 
 /// Get a required trimmed string param, or return an error message
 fn require_trimmed_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
+    require_trimmed_str_max(args, key, MAX_STRING_LEN)
+}
+
+/// Get a required trimmed string param with a custom max length
+fn require_trimmed_str_max(args: &serde_json::Value, key: &str, max_len: usize) -> Result<String, String> {
     match get_str(args, key) {
-        Some(s) => trim_non_empty(&s)
-            .ok_or_else(|| format!("Parameter '{}' cannot be empty or whitespace-only", key)),
+        Some(s) => {
+            let trimmed = trim_non_empty(&s)
+                .ok_or_else(|| format!("Parameter '{}' cannot be empty or whitespace-only", key))?;
+            if trimmed.len() > max_len {
+                Err(format!("Parameter '{}' exceeds maximum length of {} characters", key, max_len))
+            } else {
+                Ok(trimmed)
+            }
+        }
         None => Err(format!("Missing required parameter: {}", key)),
     }
 }
 
-/// Get an optional trimmed string param
+/// Get an optional trimmed string param (capped at MAX_STRING_LEN)
 fn optional_trimmed_str(args: &serde_json::Value, key: &str) -> Option<String> {
-    get_str(args, key).and_then(|s| trim_non_empty(&s))
+    get_str(args, key).and_then(|s| {
+        trim_non_empty(&s).map(|t| if t.len() > MAX_STRING_LEN { t[..MAX_STRING_LEN].to_string() } else { t })
+    })
 }
 
 /// Basic email validation (must contain @ with text on both sides)
@@ -413,12 +429,29 @@ impl TalentMcpServer {
             return error_result("Invalid email format: must contain '@' with a valid domain (e.g. user@example.com)");
         }
 
+        // Check for duplicate email
+        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM talent.candidates WHERE email = $1")
+            .bind(&email)
+            .fetch_one(self.db.pool())
+            .await
+        {
+            Ok(count) if count > 0 => {
+                return error_result(&format!("A candidate with email '{}' already exists", email));
+            }
+            Err(e) => {
+                error!(error = %e, email = %email, "Failed to check duplicate email");
+                return error_result(&format!("Database error checking email uniqueness: {e}"));
+            }
+            _ => {}
+        }
+
         let phone = optional_trimmed_str(args, "phone").unwrap_or_default();
         let skills = trimmed_str_array(args, "skills");
-        let experience_years = get_i64(args, "experience_years").unwrap_or(0) as i32;
-        if experience_years < 0 {
-            return error_result("experience_years must be >= 0");
+        let exp_raw = get_i64(args, "experience_years").unwrap_or(0);
+        if exp_raw < 0 || exp_raw > i32::MAX as i64 {
+            return error_result("experience_years must be between 0 and 2147483647");
         }
+        let experience_years = exp_raw as i32;
         let current_company = optional_trimmed_str(args, "current_company").unwrap_or_default();
         let desired_salary = get_f64(args, "desired_salary");
         if let Some(salary) = desired_salary {
@@ -568,17 +601,12 @@ impl TalentMcpServer {
             param_idx += 1;
         }
 
+        // Count query (same WHERE clause, no LIMIT/OFFSET)
+        let count_sql = sql.replace("SELECT *", "SELECT COUNT(*)");
+
         sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${} OFFSET ${}", param_idx, param_idx + 1));
-        // Bind limit and offset as i64
-        params.floats.push(limit as f64); // placeholder — we'll bind as i64 below
-        params.floats.push(offset as f64);
 
-        // Actually we need to bind limit/offset differently. Let's use ints.
-        // Remove the float placeholders we just pushed.
-        params.floats.pop();
-        params.floats.pop();
-
-        // Build the query with dynamic bindings
+        // Build the data query with dynamic bindings
         let mut q = sqlx::query_as::<_, Candidate>(&sql);
         for bind in &params.binds {
             match bind {
@@ -588,12 +616,36 @@ impl TalentMcpServer {
                 BindType::StrArray(i) => q = q.bind(&params.arrays[*i]),
             }
         }
-        // Bind limit and offset
         q = q.bind(limit);
         q = q.bind(offset);
 
-        match q.fetch_all(self.db.pool()).await {
-            Ok(candidates) => json_result(&candidates),
+        // Build the count query with same bindings (no limit/offset)
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+        for bind in &params.binds {
+            match bind {
+                BindType::Str(i) => cq = cq.bind(&params.strings[*i]),
+                BindType::Int(i) => cq = cq.bind(params.ints[*i]),
+                BindType::Float(i) => cq = cq.bind(params.floats[*i]),
+                BindType::StrArray(i) => cq = cq.bind(&params.arrays[*i]),
+            }
+        }
+
+        let (data_result, count_result) = tokio::join!(
+            q.fetch_all(self.db.pool()),
+            cq.fetch_one(self.db.pool())
+        );
+
+        match data_result {
+            Ok(candidates) => {
+                let total = count_result.unwrap_or(candidates.len() as i64);
+                json_result(&serde_json::json!({
+                    "candidates": candidates,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": offset + limit < total,
+                }))
+            }
             Err(e) => {
                 error!(error = %e, "Search candidates failed");
                 error_result(&format!("Search failed: {e}"))
@@ -770,18 +822,47 @@ impl TalentMcpServer {
             }
         }
 
-        // Verify job exists
+        // Verify job exists and is open
         match sqlx::query_as::<_, Job>("SELECT * FROM talent.jobs WHERE id = $1")
             .bind(&job_id)
             .fetch_optional(self.db.pool())
             .await
         {
-            Ok(Some(_)) => {}
+            Ok(Some(job)) => {
+                if job.status != "open" {
+                    return error_result(&format!(
+                        "Job '{}' is not open (current status: '{}'). Candidates can only be submitted to open jobs.",
+                        job_id, job.status
+                    ));
+                }
+            }
             Ok(None) => return error_result(&format!("Job '{}' not found", job_id)),
             Err(e) => {
                 error!(error = %e, job_id = %job_id, "Failed to verify job");
                 return error_result(&format!("Database error: {e}"));
             }
+        }
+
+        // Check for duplicate submission
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM talent.submissions WHERE candidate_id = $1 AND job_id = $2",
+        )
+        .bind(&candidate_id)
+        .bind(&job_id)
+        .fetch_one(self.db.pool())
+        .await
+        {
+            Ok(count) if count > 0 => {
+                return error_result(&format!(
+                    "Candidate '{}' has already been submitted to job '{}'",
+                    candidate_id, job_id
+                ));
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to check duplicate submission");
+                return error_result(&format!("Database error: {e}"));
+            }
+            _ => {}
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -997,7 +1078,7 @@ impl TalentMcpServer {
             Ok(c) => c,
             Err(e) => return error_result(&e),
         };
-        let note = match require_trimmed_str(args, "note") {
+        let note = match require_trimmed_str_max(args, "note", MAX_NOTE_LEN) {
             Ok(n) => n,
             Err(e) => return error_result(&e),
         };
@@ -1074,16 +1155,29 @@ impl TalentMcpServer {
             }
         } else {
             let (limit, offset) = pagination(args);
-            // List all saved searches with pagination
-            match sqlx::query_as::<_, SavedSearch>(
-                "SELECT * FROM talent.saved_searches ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(self.db.pool())
-            .await
-            {
-                Ok(searches) => json_result(&searches),
+            // List all saved searches with pagination + count
+            let (data_result, count_result) = tokio::join!(
+                sqlx::query_as::<_, SavedSearch>(
+                    "SELECT * FROM talent.saved_searches ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(self.db.pool()),
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM talent.saved_searches")
+                    .fetch_one(self.db.pool())
+            );
+
+            match data_result {
+                Ok(searches) => {
+                    let total = count_result.unwrap_or(searches.len() as i64);
+                    json_result(&serde_json::json!({
+                        "searches": searches,
+                        "total": total,
+                        "limit": limit,
+                        "offset": offset,
+                        "has_more": offset + limit < total,
+                    }))
+                }
                 Err(e) => {
                     error!(error = %e, "Failed to list saved searches");
                     error_result(&format!("Failed to list saved searches: {e}"))
