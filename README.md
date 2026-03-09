@@ -1,45 +1,91 @@
-# dataxlr8-talent-mcp
+# :briefcase: dataxlr8-talent-mcp
 
-Talent management MCP for DataXLR8 — manage candidates, jobs, applications, and candidate notes with powerful search and submission tracking.
+Recruitment and talent management for AI agents — candidates, jobs, submissions, matching, and saved searches.
+
+[![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
+[![MCP](https://img.shields.io/badge/MCP-rmcp_0.17-blue)](https://modelcontextprotocol.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+## What It Does
+
+Manages the full recruitment lifecycle through MCP tool calls. Maintain a candidate pool with skills and salary expectations, post open positions, submit candidates to jobs with status tracking, and use skill-based matching to find the right fit. Supports paginated listing, saved search criteria, and candidate notes — all backed by PostgreSQL.
+
+## Architecture
+
+```
+                    ┌─────────────────────────┐
+AI Agent ──stdio──▶ │  dataxlr8-talent-mcp    │
+                    │  (rmcp 0.17 server)      │
+                    └──────────┬──────────────┘
+                               │ sqlx 0.8
+                               ▼
+                    ┌─────────────────────────┐
+                    │  PostgreSQL              │
+                    │  schema: talent          │
+                    │  ├── candidates          │
+                    │  ├── jobs                │
+                    │  ├── submissions         │
+                    │  ├── candidate_notes     │
+                    │  └── saved_searches      │
+                    └─────────────────────────┘
+```
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| add_candidate | Add a new candidate to the talent pool |
-| get_candidate | Get candidate details by ID or email |
-| list_candidates | List candidates with filters by status, skills, salary range (paginated) |
-| update_candidate | Update candidate information |
-| delete_candidate | Delete a candidate and all related submissions |
-| add_candidate_note | Add a note to a candidate's profile |
-| list_candidate_notes | Get all notes for a candidate (paginated) |
-| add_job | Add a new open job position |
-| get_job | Get job details by ID |
-| list_jobs | List jobs with filters by status, location, salary range (paginated) |
-| update_job | Update job information |
-| delete_job | Delete a job and related submissions |
-| submit_candidate | Submit a candidate for a job position |
-| get_submission | Get submission details by ID |
-| list_submissions | List submissions with filters by status, candidate, or job (paginated) |
-| update_submission | Update submission status |
-| find_candidates_for_job | Find matching candidates for a job based on skills and experience |
-| saved_searches | Search and save candidate search criteria |
+| `add_candidate` | Add a new candidate to the talent pool |
+| `search_candidates` | Search by skills, experience, salary range |
+| `update_status` | Update a candidate's pipeline status |
+| `add_note` | Add a note to a candidate's profile |
+| `create_job` | Create a new open position |
+| `submit_candidate` | Submit a candidate for a specific job |
+| `match_candidates` | Find matching candidates for a job by skills and experience |
+| `candidate_pipeline` | View candidates grouped by pipeline stage |
+| `placement_stats` | Get placement and submission statistics |
+| `talent_search_saved` | Save and retrieve search criteria |
 
-## Setup
+## Quick Start
 
 ```bash
-DATABASE_URL=postgres://dataxlr8:dataxlr8@localhost:5432/dataxlr8 cargo run
+git clone https://github.com/pdaxt/dataxlr8-talent-mcp
+cd dataxlr8-talent-mcp
+cargo build --release
+
+export DATABASE_URL=postgres://user:pass@localhost:5432/dataxlr8
+./target/release/dataxlr8-talent-mcp
 ```
 
-## Schema
+The server auto-creates the `talent` schema and all tables on first run.
 
-Creates `talent.*` schema in PostgreSQL with tables for:
-- `candidates` — candidate profiles with skills, experience, salary expectations
-- `jobs` — open positions with requirements and salary ranges
-- `submissions` — candidate applications and submissions to jobs
-- `candidate_notes` — notes and feedback on candidates
-- `saved_searches` — saved candidate search criteria
+## Configuration
 
-## Part of
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `LOG_LEVEL` | No | Tracing level (default: `info`) |
 
-[DataXLR8](https://github.com/pdaxt) - AI-powered recruitment platform
+## Claude Desktop Integration
+
+Add to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "dataxlr8-talent": {
+      "command": "./target/release/dataxlr8-talent-mcp",
+      "env": {
+        "DATABASE_URL": "postgres://user:pass@localhost:5432/dataxlr8"
+      }
+    }
+  }
+}
+```
+
+## Part of DataXLR8
+
+One of 14 Rust MCP servers that form the [DataXLR8](https://github.com/pdaxt) platform — a modular, AI-native business operations suite. Each server owns a single domain, shares a PostgreSQL instance, and communicates over the Model Context Protocol.
+
+## License
+
+MIT
