@@ -5,6 +5,10 @@ edition = "2024"
 description = "Talent recruitment MCP server for DataXLR8 platform"
 repository = "https://github.com/pdaxt/dataxlr8-talent-mcp"
 
+
+[lib]
+name = "dataxlr8_talent_mcp"
+path = "src/lib.rs"
 [dependencies]
 # MCP SDK
 rmcp = { version = "0.17", features = ["server", "transport-io"] }
